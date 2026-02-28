@@ -60,8 +60,10 @@ static unsigned long lastDisplayUpdate = 0;
 static BluetoothSerial  SerialBT;
 static volatile bool    sppClientConnected = false;
 static volatile bool    isTranscribing     = false;  // toggled by BtnA
+static volatile bool    isPlayingTTS       = false;  // true while playing TTS audio
 static TaskHandle_t     micTaskHandle      = nullptr;
 static constexpr uint32_t MIC_SAMPLE_RATE  = 16000; // 16kHz for Whisper
+static constexpr uint32_t TTS_SAMPLE_RATE  = 24000; // 24kHz from OpenRouter TTS
 
 // Transcription result display (received from Python via SPP)
 static String lastTranscription = "";
@@ -148,6 +150,22 @@ static void drawDisplay() {
             StickCP2.Display.drawString("Run on Mac:", dispW / 2, dispH / 2 - 10);
             StickCP2.Display.setFont(&fonts::Font0);
             StickCP2.Display.drawString("python voice_bridge_esp32.py transcribe", dispW / 2, dispH / 2 + 10);
+        } else if (isPlayingTTS) {
+            StickCP2.Display.setTextColor(CYAN);
+            StickCP2.Display.setTextDatum(top_center);
+            StickCP2.Display.drawString("Playing...", dispW / 2, 30);
+            if (textMutex && xSemaphoreTake(textMutex, pdMS_TO_TICKS(10))) {
+                if (lastTranscription.length() > 0) {
+                    StickCP2.Display.setTextColor(WHITE);
+                    StickCP2.Display.setTextDatum(top_left);
+                    StickCP2.Display.setTextWrap(true);
+                    StickCP2.Display.setCursor(4, 50);
+                    String disp = lastTranscription;
+                    if (disp.length() > 90) disp = disp.substring(disp.length() - 90);
+                    StickCP2.Display.print(disp);
+                }
+                xSemaphoreGive(textMutex);
+            }
         } else if (isTranscribing) {
             // Recording indicator
             StickCP2.Display.setTextColor(RED);
@@ -299,6 +317,45 @@ static constexpr uint8_t  FRAME_MAGIC_0 = 0x55;
 static constexpr uint8_t  FRAME_MAGIC_1 = 0xAA;
 static constexpr size_t   MIC_CHUNK     = 512;  // samples per read (~32ms @ 16kHz)
 
+// TTS audio frame: [0xAA][0x55][len_hi][len_lo][pcm_data...]  (reversed magic)
+static constexpr uint8_t  TTS_MAGIC_0   = 0xAA;
+static constexpr uint8_t  TTS_MAGIC_1   = 0x55;
+
+// I2S TX handle for TTS playback (SOURCE mode)
+static i2s_chan_handle_t ttsTxHandle = nullptr;
+
+static void initI2sTTS() {
+    i2s_chan_config_t chanCfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    chanCfg.dma_desc_num  = 8;
+    chanCfg.dma_frame_num = 256;
+    chanCfg.auto_clear    = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chanCfg, &ttsTxHandle, nullptr));
+
+    i2s_std_config_t stdCfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(TTS_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SPK_BCLK,
+            .ws   = SPK_LRC,
+            .dout = SPK_DOUT,
+            .din  = I2S_GPIO_UNUSED,
+            .invert_flags = { false, false, false },
+        },
+    };
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(ttsTxHandle, &stdCfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(ttsTxHandle));
+}
+
+static void deinitI2sTTS() {
+    if (ttsTxHandle) {
+        i2s_channel_disable(ttsTxHandle);
+        i2s_del_channel(ttsTxHandle);
+        ttsTxHandle = nullptr;
+    }
+}
+
 // SPP connection events (set by callback, processed by micTask)
 static volatile bool sppEventConnect = false;
 static volatile bool sppEventDisconnect = false;
@@ -312,7 +369,7 @@ static void sppCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t* param) {
     }
 }
 
-// Core 0 task: read mic when transcribing, read SPP text results
+// Core 0 task: read mic when transcribing, handle SPP text + TTS audio
 static void micTask(void*) {
     static int16_t chunk[MIC_CHUNK];
     uint8_t header[4];
@@ -338,7 +395,7 @@ static void micTask(void*) {
             Serial.println("[SPP] Client disconnected (callback)");
         }
 
-        // Fallback: poll hasClient() every 500ms in case callback didn't fire
+        // Fallback: poll hasClient() every 500ms
         if (millis() - lastClientCheck > 500) {
             lastClientCheck = millis();
             bool has = SerialBT.hasClient();
@@ -355,8 +412,73 @@ static void micTask(void*) {
             }
         }
 
-        // Read incoming text from Python (transcription results)
+        // Read incoming data from Python (text lines or TTS audio frames)
         while (SerialBT.available()) {
+            uint8_t b = SerialBT.peek();
+
+            // Check for TTS audio frame: [0xAA][0x55][len_hi][len_lo][pcm...]
+            if (b == TTS_MAGIC_0) {
+                SerialBT.read(); // consume 0xAA
+                if (SerialBT.available() && SerialBT.peek() == TTS_MAGIC_1) {
+                    SerialBT.read(); // consume 0x55
+                    // Read length (2 bytes, big-endian)
+                    while (SerialBT.available() < 2) vTaskDelay(1);
+                    uint8_t hdr[2];
+                    SerialBT.readBytes(hdr, 2);
+                    uint16_t audioLen = (hdr[0] << 8) | hdr[1];
+
+                    if (audioLen == 0) {
+                        // End-of-TTS marker
+                        Serial.println("[TTS] Playback complete");
+                        deinitI2sTTS();
+                        isPlayingTTS = false;
+                        // Restart mic
+                        StickCP2.Mic.begin();
+                        continue;
+                    }
+
+                    // First TTS frame: init speaker
+                    if (!isPlayingTTS) {
+                        isPlayingTTS = true;
+                        StickCP2.Mic.end();   // free GPIO0
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        initI2sTTS();
+                        Serial.println("[TTS] Playing audio...");
+                    }
+
+                    // Read and play audio data
+                    static uint8_t ttsBuf[2048];
+                    uint16_t remaining = audioLen;
+                    while (remaining > 0) {
+                        uint16_t toRead = (remaining > sizeof(ttsBuf)) ? sizeof(ttsBuf) : remaining;
+                        uint16_t got = 0;
+                        unsigned long deadline = millis() + 2000;
+                        while (got < toRead && millis() < deadline) {
+                            int avail = SerialBT.available();
+                            if (avail > 0) {
+                                int rd = SerialBT.readBytes(ttsBuf + got,
+                                    min((int)(toRead - got), avail));
+                                got += rd;
+                            } else {
+                                vTaskDelay(1);
+                            }
+                        }
+                        if (got > 0 && ttsTxHandle) {
+                            size_t written = 0;
+                            i2s_channel_write(ttsTxHandle, ttsBuf, got,
+                                              &written, pdMS_TO_TICKS(200));
+                        }
+                        remaining -= got;
+                        if (got == 0) break;
+                    }
+                } else {
+                    // Not TTS frame, treat as text char 0xAA
+                    if (incomingText.length() < 256) incomingText += (char)0xAA;
+                }
+                continue;
+            }
+
+            // Text data (transcription results)
             char c = (char)SerialBT.read();
             if (c == '\n') {
                 if (incomingText.length() > 0) {

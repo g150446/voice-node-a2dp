@@ -558,6 +558,77 @@ def _send_to_whisper(wav_bytes: bytes, whisper_url: str) -> str:
         return f"[Whisper error: {exc}]"
 
 
+# TTS audio frame: [0xAA][0x55][len_hi][len_lo][pcm_data...]
+TTS_MAGIC = b"\xAA\x55"
+
+def _send_tts_frame(ser, pcm_chunk: bytes) -> None:
+    """Send one TTS audio frame over SPP."""
+    length = len(pcm_chunk)
+    header = TTS_MAGIC + struct.pack(">H", length)
+    ser.write(header + pcm_chunk)
+
+def _send_tts_end(ser) -> None:
+    """Send TTS end marker (zero-length frame)."""
+    ser.write(TTS_MAGIC + b"\x00\x00")
+
+def _text_to_speech_and_send(text: str, ser) -> None:
+    """Send text to OpenRouter TTS, stream PCM audio back to M5StickC via SPP."""
+    import requests, base64, os
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        print("[TTS] No OPENROUTER_API_KEY set, skipping TTS")
+        return
+
+    print(f"[TTS] Generating speech for: {text[:60]}...")
+    try:
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "openai/gpt-audio-mini",
+                "modalities": ["text", "audio"],
+                "audio": {"voice": "alloy", "format": "pcm16"},
+                "messages": [{"role": "user", "content": text}],
+                "stream": True,
+            },
+            stream=True,
+            timeout=60,
+        )
+        resp.raise_for_status()
+
+        total_bytes = 0
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8")
+            if not line_str.startswith("data: "):
+                continue
+            payload = line_str[6:]
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                if "audio" in delta and "data" in delta["audio"]:
+                    pcm = base64.b64decode(delta["audio"]["data"])
+                    if pcm:
+                        _send_tts_frame(ser, pcm)
+                        total_bytes += len(pcm)
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass
+
+        _send_tts_end(ser)
+        print(f"[TTS] Sent {total_bytes} bytes of audio")
+
+    except Exception as exc:
+        print(f"[TTS] Error: {exc}")
+        _send_tts_end(ser)
+
+
 def run_transcribe(
     whisper_url: str = "http://localhost:9000",
     bt_port: str = "",
@@ -630,6 +701,7 @@ def run_transcribe(
                             if text and text.strip():
                                 print(f">>> {text}")
                                 ser.write((text.strip() + "\n").encode('utf-8'))
+                                _text_to_speech_and_send(text.strip(), ser)
                     pcm_buffer.clear()
                     print("[REC] Stopped")
                 continue
@@ -663,8 +735,8 @@ def run_transcribe(
                         text = _send_to_whisper(wav, whisper_url)
                         if text and text.strip():
                             print(f">>> {text}")
-                            # Send transcription back to M5StickC for display
                             ser.write((text.strip() + "\n").encode('utf-8'))
+                            _text_to_speech_and_send(text.strip(), ser)
 
                     pcm_buffer.clear()
                     consecutive_silent = 0
