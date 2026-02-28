@@ -9,7 +9,7 @@ Supports bidirectional audio streaming and **real-time speech-to-text** via Whis
 ┌──────────────────┐       Bluetooth        ┌──────────────┐
 │ M5StickC Plus2   │◄──────────────────────►│  Mac          │
 │ + Hat SPK2       │  A2DP (SINK mode)      │              │
-│                  │  SPP serial (SOURCE)   │  a2dp_voice.py
+│                  │  SPP serial (SOURCE)   │  voice_bridge_esp32.py
 │  PDM Mic (16kHz) │────── SPP RFCOMM ─────►│  → Whisper STT│
 └──────────────────┘                        └──────────────┘
 ```
@@ -26,9 +26,9 @@ Mode is selected on the device via **BtnA** (SINK) or **BtnB** (SOURCE), stored 
 ## Repository Structure
 
 ```
-├── a2dp_voice/
-│   └── a2dp_voice.ino      # Arduino firmware for M5StickC Plus2
-├── a2dp_voice.py            # Python companion script (Mac side)
+├── voice_bridge_esp32/
+│   └── voice_bridge_esp32.ino      # Arduino firmware for M5StickC Plus2
+├── voice_bridge_esp32.py            # Python companion script (Mac side)
 ├── mic_playback_stickc/
 │   └── mic_playback_stickc.ino  # Standalone mic→speaker test sketch
 ├── requirements.txt         # Python dependencies
@@ -36,7 +36,7 @@ Mode is selected on the device via **BtnA** (SINK) or **BtnB** (SOURCE), stored 
 └── README.md                # This file
 ```
 
-### Firmware (`a2dp_voice/a2dp_voice.ino`)
+### Firmware (`voice_bridge_esp32/voice_bridge_esp32.ino`)
 
 Single Arduino sketch with two runtime modes:
 
@@ -51,7 +51,7 @@ The SPP audio frame protocol:
 - Length: uint16 big-endian (PCM bytes following)
 - PCM: int16_t little-endian, 16kHz mono, 512 samples per frame (~32ms)
 
-### Python Companion (`a2dp_voice.py`)
+### Python Companion (`voice_bridge_esp32.py`)
 
 Mac-side CLI tool with these subcommands:
 
@@ -76,8 +76,8 @@ Mac-side CLI tool with these subcommands:
 ### 1. Flash Firmware
 
 ```bash
-arduino-cli compile --fqbn m5stack:esp32:m5stack_stickc_plus2 a2dp_voice/
-arduino-cli upload -p /dev/tty.usbserial-* --fqbn m5stack:esp32:m5stack_stickc_plus2 a2dp_voice/
+arduino-cli compile --fqbn m5stack:esp32:m5stack_stickc_plus2 voice_bridge_esp32/
+arduino-cli upload -p /dev/tty.usbserial-* --fqbn m5stack:esp32:m5stack_stickc_plus2 voice_bridge_esp32/
 ```
 
 ### 2. Install Python Dependencies
@@ -92,7 +92,7 @@ pip install -r requirements.txt
 Press **BtnB** on M5StickC to enter SOURCE mode (requires reboot). Then:
 
 ```bash
-python a2dp_voice.py pair --device M5StickC
+python voice_bridge_esp32.py pair --device M5StickC
 ```
 
 > **Note**: macOS Bluetooth Settings may show the device as "Not Connected" after pairing. This is normal — the `transcribe` command establishes its own SPP connection via IOBluetooth SDP discovery. You don't need the device to show "Connected" in System Settings.
@@ -101,7 +101,7 @@ python a2dp_voice.py pair --device M5StickC
 
 ```bash
 # Start your Whisper server first, then:
-python a2dp_voice.py transcribe --whisper-url http://localhost:9000
+python voice_bridge_esp32.py transcribe --whisper-url http://localhost:9000
 ```
 
 The script will:

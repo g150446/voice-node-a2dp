@@ -3,12 +3,12 @@
 A2DP Voice Bridge — Mac companion for M5StickC Plus2
 
 Usage:
-    python a2dp_voice.py list
-    python a2dp_voice.py pair        [--device M5StickC] [--scan-time 15]
-    python a2dp_voice.py configure   --port /dev/tty.usbserial-*
-    python a2dp_voice.py sink        [--device M5StickC] [--latency 0.1]
-    python a2dp_voice.py source      [--device M5StickC] [--latency 0.1]
-    python a2dp_voice.py transcribe  [--whisper-url http://localhost:9000]
+    python voice_bridge_esp32.py list
+    python voice_bridge_esp32.py pair        [--device M5StickC] [--scan-time 15]
+    python voice_bridge_esp32.py configure   --port /dev/tty.usbserial-*
+    python voice_bridge_esp32.py sink        [--device M5StickC] [--latency 0.1]
+    python voice_bridge_esp32.py source      [--device M5StickC] [--latency 0.1]
+    python voice_bridge_esp32.py transcribe  [--whisper-url http://localhost:9000]
 
 Dependencies:
     pip install -r requirements.txt   # sounddevice numpy pyserial requests
@@ -53,7 +53,7 @@ def _require_blueutil() -> str:
         sys.exit(
             "blueutil not found. Install it with:\n"
             "    brew install blueutil\n"
-            "Then re-run: python a2dp_voice.py pair"
+            "Then re-run: python voice_bridge_esp32.py pair"
         )
     return path
 
@@ -118,7 +118,7 @@ def bt_pair(device_name: str, scan_time: int) -> None:
 
     mac_bt_name = _get_mac_bt_name()
     print(f"This Mac's BT name: {mac_bt_name!r}")
-    print(f"(Needed for SOURCE mode — run 'python a2dp_voice.py configure' after pairing)\n")
+    print(f"(Needed for SOURCE mode — run 'python voice_bridge_esp32.py configure' after pairing)\n")
 
     # 1. Make sure Bluetooth is on
     r = _run([blueutil, "--power"])
@@ -153,7 +153,7 @@ def bt_pair(device_name: str, scan_time: int) -> None:
         print("     System Settings → Privacy & Security → Bluetooth → enable your terminal")
         print("  2. For first-time pairing, switch M5Stick to SINK mode (press BtnA),")
         print("     then re-run this command. SINK mode is more reliably discoverable.")
-        print("  3. Try a longer scan:  python a2dp_voice.py pair --scan-time 30")
+        print("  3. Try a longer scan:  python voice_bridge_esp32.py pair --scan-time 30")
         sys.exit(1)
 
     if len(matches) > 1:
@@ -187,7 +187,7 @@ def bt_pair(device_name: str, scan_time: int) -> None:
     print(f"Connected to {name}.")
     print("\nNext steps:")
     print(f"  SINK mode  → System Settings → Sound → Output → select M5StickC-SPK")
-    print(f"  SOURCE mode → python a2dp_voice.py configure --port /dev/tty.usbserial-*")
+    print(f"  SOURCE mode → python voice_bridge_esp32.py configure --port /dev/tty.usbserial-*")
     print(f"               (writes Mac BT name {mac_bt_name!r} to M5Stick NVS)")
 
 
@@ -254,10 +254,10 @@ def configure(port: str) -> None:
     if response.startswith("OK"):
         print(f"Done — M5Stick confirmed: {response}")
         print("M5Stick will restart. Switch to SOURCE mode then run:")
-        print("  python a2dp_voice.py source")
+        print("  python voice_bridge_esp32.py source")
     else:
         print(f"No OK response received (last line: {response!r})")
-        print("Check that M5Stick is running the a2dp_voice sketch and connected via USB.")
+        print("Check that M5Stick is running the voice_bridge_esp32 sketch and connected via USB.")
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +296,7 @@ def find_device(partial: str, kind: str) -> int:
     if not matches:
         raise RuntimeError(
             f"No {kind} device matching '{partial}' found.\n"
-            "Run 'python a2dp_voice.py list' to see available devices."
+            "Run 'python voice_bridge_esp32.py list' to see available devices."
         )
     if len(matches) > 1:
         names = ", ".join(f"{i}: {d['name']}" for i, d in matches)

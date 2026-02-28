@@ -29,7 +29,7 @@ static constexpr gpio_num_t SPK_LRC  = GPIO_NUM_0;   // shared with mic PDM WS
 static constexpr gpio_num_t MIC_DATA = GPIO_NUM_34;
 
 static constexpr size_t     RING_BUF_SAMPLES = 4096; // SOURCE ring buffer
-static const char*          PREFS_NS             = "a2dp_voice";
+static const char*          PREFS_NS             = "voice_bridge";
 static const char*          PREFS_KEY_MODE        = "mode";
 static const char*          PREFS_KEY_REMOTE      = "remote"; // Mac BT name for SOURCE
 static const char*          PREFS_KEY_MAC         = "mac_addr"; // Mac BT MAC (6-byte blob)
@@ -86,7 +86,7 @@ static void writeMode(Mode m) {
 }
 
 // Returns the Mac BT device name stored in NVS, or "" if not set.
-// Set via: python a2dp_voice.py configure --port /dev/tty.usbserial-*
+// Set via: python voice_bridge_esp32.py configure --port /dev/tty.usbserial-*
 static String readRemoteName() {
     Preferences p;
     p.begin(PREFS_NS, true);
@@ -147,7 +147,7 @@ static void drawDisplay() {
             StickCP2.Display.setTextDatum(middle_center);
             StickCP2.Display.drawString("Run on Mac:", dispW / 2, dispH / 2 - 10);
             StickCP2.Display.setFont(&fonts::Font0);
-            StickCP2.Display.drawString("python a2dp_voice.py transcribe", dispW / 2, dispH / 2 + 10);
+            StickCP2.Display.drawString("python voice_bridge_esp32.py transcribe", dispW / 2, dispH / 2 + 10);
         } else if (isTranscribing) {
             // Recording indicator
             StickCP2.Display.setTextColor(RED);
@@ -435,7 +435,7 @@ static void printStatus() {
 }
 
 static void printHelp() {
-    Serial.println("--- a2dp_voice commands ---");
+    Serial.println("--- voice_bridge commands ---");
     Serial.println("  sink              switch to SINK mode (restarts)");
     Serial.println("  source            switch to SOURCE mode (restarts)");
     Serial.println("  status            print mode / BT / audio state");
@@ -503,7 +503,7 @@ void setup() {
     StickCP2.Speaker.end();
     StickCP2.Mic.end();
 
-    Serial.printf("\n=== a2dp_voice booting in %s mode ===\n",
+    Serial.printf("\n=== voice_bridge booting in %s mode ===\n",
         currentMode == MODE_SINK ? "SINK" : "SOURCE");
     Serial.println("Type 'help' for commands.");
 
