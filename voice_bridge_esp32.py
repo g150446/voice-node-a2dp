@@ -698,13 +698,33 @@ def _text_to_speech_and_send(text: str, ser) -> None:
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
 
-        # Send collected PCM in paced 512-byte frames over SPP
+        print(f"[TTS] Collected {len(all_pcm)} bytes from OpenRouter")
+
+        # Downsample 24kHz → 16kHz to reduce SPP transfer size
+        pcm_24k = np.frombuffer(bytes(all_pcm), dtype=np.int16)
+        # Simple linear interpolation downsample: 24000 → 16000 (ratio 2:3)
+        n_out = int(len(pcm_24k) * 16000 / 24000)
+        indices = np.linspace(0, len(pcm_24k) - 1, n_out)
+        pcm_16k = np.interp(indices, np.arange(len(pcm_24k)), pcm_24k.astype(np.float64))
+        pcm_bytes = pcm_16k.astype(np.int16).tobytes()
+        print(f"[TTS] Resampled to 16kHz: {len(pcm_bytes)} bytes, sending to device...")
+
+        # Send in paced frames with flow control (read back between batches)
         TTS_CHUNK = 512
-        for i in range(0, len(all_pcm), TTS_CHUNK):
-            _send_tts_frame(ser, bytes(all_pcm[i : i + TTS_CHUNK]))
-            time.sleep(0.05)
+        BATCH = 8  # send 8 frames, then drain any incoming data
+        sent = 0
+        frame_count = 0
+        for i in range(0, len(pcm_bytes), TTS_CHUNK):
+            _send_tts_frame(ser, pcm_bytes[i : i + TTS_CHUNK])
+            sent += min(TTS_CHUNK, len(pcm_bytes) - i)
+            frame_count += 1
+            time.sleep(0.06)
+            # Every BATCH frames, drain incoming SPP data to prevent backpressure
+            if frame_count % BATCH == 0:
+                while ser.in_waiting:
+                    ser.read(ser.in_waiting)
         _send_tts_end(ser)
-        print(f"[TTS] Sent {len(all_pcm)} bytes of audio")
+        print(f"[TTS] Sent {sent} bytes ({frame_count} frames) of 16kHz audio")
 
         # Save debug WAV file
         if all_pcm:

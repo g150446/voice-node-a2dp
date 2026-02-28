@@ -62,9 +62,10 @@ static BluetoothSerial  SerialBT;
 static volatile bool    sppClientConnected = false;
 static volatile bool    isTranscribing     = false;  // toggled by BtnA
 static volatile bool    isPlayingTTS       = false;  // true while playing TTS audio
+static volatile bool    ttsReady           = false;  // set by micTask, consumed by loop()
 static TaskHandle_t     micTaskHandle      = nullptr;
 static constexpr uint32_t MIC_SAMPLE_RATE  = 16000; // 16kHz for Whisper
-static constexpr uint32_t TTS_SAMPLE_RATE  = 24000; // 24kHz from OpenRouter TTS
+static constexpr uint32_t TTS_SAMPLE_RATE  = 16000; // 16kHz (downsampled from 24kHz)
 
 // Transcription result display (received from Python via SPP)
 static String lastTranscription = "";
@@ -337,21 +338,28 @@ static void initTTSBuffer() {
 }
 
 static void playTTSBuffer() {
-    if (!ttsBuf || ttsBufUsed == 0) return;
+    if (!ttsBuf || ttsBufUsed == 0) {
+        Serial.println("[TTS] No data to play");
+        return;
+    }
     size_t nSamples = ttsBufUsed / sizeof(int16_t);
     Serial.printf("[TTS] Playing %u samples (%u bytes) via Speaker API\n", nSamples, ttsBufUsed);
     StickCP2.Mic.end();
     vTaskDelay(pdMS_TO_TICKS(50));
-    StickCP2.Speaker.begin();
+    bool ok = StickCP2.Speaker.begin();
+    Serial.printf("[TTS] Speaker.begin() = %d, isEnabled=%d\n", ok, StickCP2.Speaker.isEnabled());
     StickCP2.Speaker.setVolume(255);
     StickCP2.Speaker.playRaw(ttsBuf, nSamples, TTS_SAMPLE_RATE, false, 1, 0);
+    Serial.printf("[TTS] playRaw() called, isPlaying=%d\n", StickCP2.Speaker.isPlaying());
     // Wait for playback to finish
+    unsigned long t0 = millis();
     while (StickCP2.Speaker.isPlaying()) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+    unsigned long elapsed = millis() - t0;
+    Serial.printf("[TTS] Playback done in %lu ms\n", elapsed);
     StickCP2.Speaker.stop();
     StickCP2.Speaker.end();
-    Serial.println("[TTS] Playback complete");
     StickCP2.Mic.begin();
     ttsBufUsed = 0;
 }
@@ -364,14 +372,14 @@ static void playTestTone() {
     StickCP2.Speaker.begin();
     StickCP2.Speaker.setVolume(255);
 
-    // Generate 1kHz mono sine wave at 24kHz, 2 seconds
-    static constexpr size_t TONE_SAMPLES = 48000; // 2s at 24kHz
+    // Generate 1kHz mono sine wave at 16kHz, 2 seconds
+    static constexpr size_t TONE_SAMPLES = 32000; // 2s at 16kHz
     int16_t* tone = (int16_t*)heap_caps_malloc(TONE_SAMPLES * 2, MALLOC_CAP_8BIT);
     if (tone) {
         for (size_t i = 0; i < TONE_SAMPLES; i++) {
-            tone[i] = (int16_t)(sinf(2.0f * M_PI * 1000.0f * i / 24000.0f) * 30000);
+            tone[i] = (int16_t)(sinf(2.0f * M_PI * 1000.0f * i / 16000.0f) * 30000);
         }
-        StickCP2.Speaker.playRaw(tone, TONE_SAMPLES, 24000, false, 1, 0);
+        StickCP2.Speaker.playRaw(tone, TONE_SAMPLES, 16000, false, 1, 0);
         while (StickCP2.Speaker.isPlaying()) vTaskDelay(pdMS_TO_TICKS(50));
         StickCP2.Speaker.stop();
         heap_caps_free(tone);
@@ -456,11 +464,12 @@ static void micTask(void*) {
                     uint16_t audioLen = (hdr[0] << 8) | hdr[1];
 
                     if (audioLen == 0) {
-                        // End-of-TTS marker — play buffered audio
-                        Serial.printf("[TTS] Received %u bytes, playing...\n", ttsBufUsed);
+                        // End-of-TTS marker — signal main loop to play
+                        Serial.printf("[TTS] Received %u bytes, signaling playback\n", ttsBufUsed);
                         SerialBT.printf("DBG:TTS_PLAY bytes=%u\n", ttsBufUsed);
-                        isPlayingTTS = true;
-                        playTTSBuffer();
+                        ttsReady = true;
+                        // Wait for main loop to finish playback
+                        while (ttsReady) vTaskDelay(pdMS_TO_TICKS(50));
                         isPlayingTTS = false;
                         SerialBT.println("DBG:TTS_DONE");
                         continue;
@@ -680,11 +689,31 @@ void setup() {
 
     Serial.println("=== Boot complete ===");
     printStatus();
+
+    // Startup beep to verify speaker works
+    if (currentMode == MODE_SOURCE) {
+        StickCP2.Mic.end();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        StickCP2.Speaker.begin();
+        StickCP2.Speaker.setVolume(255);
+        StickCP2.Speaker.tone(1000, 200);  // 1kHz, 200ms
+        vTaskDelay(pdMS_TO_TICKS(300));
+        StickCP2.Speaker.stop();
+        StickCP2.Speaker.end();
+        StickCP2.Mic.begin();
+        Serial.println("[BOOT] Startup beep played");
+    }
 }
 
 void loop() {
     StickCP2.update();
     handleSerial();
+
+    // Play TTS audio from main loop context (matches working mic_playback pattern)
+    if (ttsReady && ttsBuf && ttsBufUsed > 0) {
+        playTTSBuffer();
+        ttsReady = false;
+    }
 
     if (StickCP2.BtnA.wasPressed()) {
         Serial.println("[BTN] BtnA pressed");
