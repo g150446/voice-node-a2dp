@@ -1,0 +1,17 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Arduino build artefacts
+build/
+*.elf
+*.bin
+*.map
+
+# macOS
+.DS_Store
+
+# Claude session data
+.claude/
