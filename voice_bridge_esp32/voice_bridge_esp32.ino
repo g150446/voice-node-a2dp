@@ -327,12 +327,20 @@ static constexpr uint8_t  TTS_MAGIC_1   = 0x55;
 static int16_t* ttsBuf     = nullptr;
 static size_t   ttsBufSize = 0;       // allocated size in bytes
 static size_t   ttsBufUsed = 0;       // used bytes
-static constexpr size_t TTS_MAX_BYTES = 192000; // ~4s at 24kHz mono
+static constexpr size_t TTS_MAX_BYTES = 960000; // ~30s at 16kHz mono (PSRAM)
 
 static void initTTSBuffer() {
     if (!ttsBuf) {
-        ttsBuf = (int16_t*)heap_caps_malloc(TTS_MAX_BYTES, MALLOC_CAP_8BIT);
-        ttsBufSize = ttsBuf ? TTS_MAX_BYTES : 0;
+        // Prefer PSRAM for large buffer (~30s); fall back to SRAM (~6s) if unavailable
+        ttsBuf = (int16_t*)heap_caps_malloc(TTS_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ttsBuf) {
+            ttsBufSize = TTS_MAX_BYTES;
+        } else {
+            constexpr size_t FALLBACK = 192000;
+            ttsBuf = (int16_t*)heap_caps_malloc(FALLBACK, MALLOC_CAP_8BIT);
+            ttsBufSize = ttsBuf ? FALLBACK : 0;
+            Serial.printf("[TTS] PSRAM unavailable, fallback buffer: %u bytes\n", ttsBufSize);
+        }
     }
     ttsBufUsed = 0;
 }

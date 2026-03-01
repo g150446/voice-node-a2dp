@@ -33,6 +33,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import queue
 import threading
 import time
 import numpy as np
@@ -650,6 +651,15 @@ def _send_tts_end(ser) -> None:
     """Send TTS end marker (zero-length frame)."""
     ser.write(TTS_MAGIC + b"\x00\x00")
 
+def _downsample_chunk_3to2(samples_24k: np.ndarray) -> np.ndarray:
+    """3:2 polyphase downsample 24kHz→16kHz. Input length must be multiple of 3."""
+    assert len(samples_24k) % 3 == 0
+    s = samples_24k.astype(np.float64).reshape(-1, 3)
+    out = np.empty((len(s), 2), dtype=np.float64)
+    out[:, 0] = s[:, 0]
+    out[:, 1] = (s[:, 1] + s[:, 2]) * 0.5
+    return out.reshape(-1).astype(np.int16)
+
 def _text_to_speech_and_send(text: str, ser) -> None:
     """Send text to OpenRouter TTS, stream PCM audio back to M5StickC via SPP."""
     import requests, base64
@@ -678,63 +688,107 @@ def _text_to_speech_and_send(text: str, ser) -> None:
         )
         resp.raise_for_status()
 
-        all_pcm = bytearray()
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line_str = line.decode("utf-8")
-            if not line_str.startswith("data: "):
-                continue
-            payload = line_str[6:]
-            if payload == "[DONE]":
-                break
+        q: queue.Queue = queue.Queue(maxsize=16)
+        carry_24k: bytearray = bytearray()
+        all_pcm_debug: bytearray = bytearray()
+        producer_error: list = []
+
+        def _producer() -> None:
             try:
-                chunk = json.loads(payload)
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                if "audio" in delta and "data" in delta["audio"]:
-                    pcm = base64.b64decode(delta["audio"]["data"])
-                    if pcm:
-                        all_pcm.extend(pcm)
-            except (json.JSONDecodeError, KeyError, IndexError):
-                pass
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    line_str = line.decode("utf-8")
+                    if not line_str.startswith("data: "):
+                        continue
+                    payload = line_str[6:]
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        chunk_json = json.loads(payload)
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                        if "audio" in delta and "data" in delta["audio"]:
+                            pcm_raw = base64.b64decode(delta["audio"]["data"])
+                            if not pcm_raw:
+                                continue
+                            all_pcm_debug.extend(pcm_raw)
+                            carry_24k.extend(pcm_raw)
+                            aligned = len(carry_24k) - (len(carry_24k) % 6)
+                            if aligned >= 6:
+                                samples_24k = np.frombuffer(bytes(carry_24k[:aligned]), dtype=np.int16)
+                                q.put(_downsample_chunk_3to2(samples_24k).tobytes())
+                                del carry_24k[:aligned]
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        pass
+                # Flush leftover carry bytes
+                if len(carry_24k) >= 2:
+                    pad = (6 - len(carry_24k) % 6) % 6
+                    carry_24k.extend(b"\x00" * pad)
+                    samples_24k = np.frombuffer(bytes(carry_24k), dtype=np.int16)
+                    q.put(_downsample_chunk_3to2(samples_24k).tobytes())
+                    carry_24k.clear()
+            except Exception as exc:
+                producer_error.append(exc)
+            finally:
+                q.put(None)
 
-        print(f"[TTS] Collected {len(all_pcm)} bytes from OpenRouter")
+        t = threading.Thread(target=_producer, daemon=True, name="tts-producer")
+        t.start()
+        print(f"[TTS] Streaming from OpenRouter (producer started)...")
 
-        # Downsample 24kHz → 16kHz to reduce SPP transfer size
-        pcm_24k = np.frombuffer(bytes(all_pcm), dtype=np.int16)
-        # Simple linear interpolation downsample: 24000 → 16000 (ratio 2:3)
-        n_out = int(len(pcm_24k) * 16000 / 24000)
-        indices = np.linspace(0, len(pcm_24k) - 1, n_out)
-        pcm_16k = np.interp(indices, np.arange(len(pcm_24k)), pcm_24k.astype(np.float64))
-        pcm_bytes = pcm_16k.astype(np.int16).tobytes()
-        print(f"[TTS] Resampled to 16kHz: {len(pcm_bytes)} bytes, sending to device...")
-
-        # Send in paced frames with flow control (read back between batches)
         TTS_CHUNK = 512
-        BATCH = 8  # send 8 frames, then drain any incoming data
-        sent = 0
+        BATCH = 4
+        send_buf: bytearray = bytearray()
         frame_count = 0
-        for i in range(0, len(pcm_bytes), TTS_CHUNK):
-            _send_tts_frame(ser, pcm_bytes[i : i + TTS_CHUNK])
-            sent += min(TTS_CHUNK, len(pcm_bytes) - i)
-            frame_count += 1
-            time.sleep(0.06)
-            # Every BATCH frames, drain incoming SPP data to prevent backpressure
-            if frame_count % BATCH == 0:
-                while ser.in_waiting:
-                    ser.read(ser.in_waiting)
-        _send_tts_end(ser)
-        print(f"[TTS] Sent {sent} bytes ({frame_count} frames) of 16kHz audio")
+        sent = 0
+        end_sent = False
 
-        # Save debug WAV file
-        if all_pcm:
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=30)
+                except queue.Empty:
+                    print("[TTS] Producer timeout — aborting send")
+                    break
+                if item is None:
+                    break
+                send_buf.extend(item)
+                while len(send_buf) >= TTS_CHUNK:
+                    _send_tts_frame(ser, bytes(send_buf[:TTS_CHUNK]))
+                    del send_buf[:TTS_CHUNK]
+                    sent += TTS_CHUNK
+                    frame_count += 1
+                    time.sleep(0.01)          # B1 FIX: was 0.06
+                    if frame_count % BATCH == 0:
+                        while ser.in_waiting:
+                            ser.read(ser.in_waiting)
+            if send_buf:
+                _send_tts_frame(ser, bytes(send_buf))
+                sent += len(send_buf)
+                frame_count += 1
+                time.sleep(0.01)
+            _send_tts_end(ser)
+            end_sent = True
+            print(f"[TTS] Sent {sent} bytes ({frame_count} frames) of 16kHz audio")
+        except Exception as exc:
+            print(f"[TTS] Consumer error: {exc}")
+        finally:
+            if not end_sent:
+                _send_tts_end(ser)   # always unblock ESP32
+            t.join(timeout=10)
+            if t.is_alive():
+                print("[TTS] Warning: producer thread still alive after join timeout")
+
+        if producer_error:
+            print(f"[TTS] Producer error: {producer_error[0]}")
+
+        print(f"[TTS] Collected {len(all_pcm_debug)} bytes from OpenRouter")
+        if all_pcm_debug:
             import wave
             debug_path = os.path.join(os.path.dirname(__file__) or ".", "tts_debug.wav")
             with wave.open(debug_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(24000)
-                wf.writeframes(bytes(all_pcm))
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(24000)
+                wf.writeframes(bytes(all_pcm_debug))
             print(f"[TTS] Debug audio saved: {debug_path}")
 
     except Exception as exc:
@@ -745,7 +799,7 @@ def _text_to_speech_and_send(text: str, ser) -> None:
 def run_transcribe(
     whisper_url: str = "http://localhost:9000",
     bt_port: str = "",
-    chunk_sec: float = 3.0,
+    chunk_sec: float = 20.0,
     silence_thresh: float = 0.02,
 ) -> None:
     """
@@ -796,7 +850,7 @@ def run_transcribe(
     recording = False
     pcm_buffer = bytearray()
     max_chunk_bytes = int(chunk_sec * SAMPLE_RATE * 2)
-    silence_bytes = int(0.5 * SAMPLE_RATE * 2)
+    silence_bytes = int(1.5 * SAMPLE_RATE * 2)
     consecutive_silent = 0
 
     try:
@@ -842,7 +896,7 @@ def run_transcribe(
 
                 should_send = (
                     len(pcm_buffer) >= max_chunk_bytes
-                    or (len(pcm_buffer) > SAMPLE_RATE * 2
+                    or (len(pcm_buffer) > SAMPLE_RATE
                         and consecutive_silent >= silence_bytes)
                 )
 
@@ -908,8 +962,8 @@ def main() -> None:
                       help="Whisper STT server URL (default: http://localhost:9000)")
     tr_p.add_argument("--bt-port", default="",
                       help="BT serial port (auto-detected if omitted)")
-    tr_p.add_argument("--chunk-sec", type=float, default=3.0,
-                      help="Max audio chunk duration in seconds (default: 3.0)")
+    tr_p.add_argument("--chunk-sec", type=float, default=20.0,
+                      help="Max audio chunk duration in seconds (default: 20.0)")
     tr_p.add_argument("--silence-thresh", type=float, default=0.02,
                       help="RMS silence threshold for VAD (default: 0.02)")
 
