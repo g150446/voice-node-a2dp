@@ -92,7 +92,7 @@ class SppBridge {
         // Keep-alive: send a null byte every 10 s so the BT stack doesn't idle-disconnect
         val keepAliveJob = launch {
             while (isActive) {
-                delay(5_000)
+                delay(2_000)
                 try {
                     synchronized(outLock) { outputStream.write(0); outputStream.flush() }
                 } catch (_: Exception) {}

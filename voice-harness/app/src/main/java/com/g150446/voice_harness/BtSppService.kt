@@ -7,8 +7,12 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.net.wifi.WifiManager
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -46,6 +50,7 @@ class BtSppService : Service() {
     private var testJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var btReceiver: BroadcastReceiver? = null
 
     val state = MutableStateFlow(BridgeState.IDLE)
     val logs = MutableStateFlow<List<String>>(emptyList())
@@ -76,6 +81,31 @@ class BtSppService : Service() {
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "VoiceHarness::BtSpp")
             .also { it.acquire() }
         startForeground(NOTIF_ID, buildNotification())
+
+        // Detect ACL disconnect immediately rather than waiting for socket read to fail
+        if (btReceiver == null) {
+            btReceiver = object : BroadcastReceiver() {
+                @Suppress("DEPRECATION")
+                override fun onReceive(context: Context, intent: Intent) {
+                    val device: BluetoothDevice? =
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                        else
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    if (device?.name?.contains("M5") == true &&
+                        state.value != BridgeState.IDLE && state.value != BridgeState.CONNECTING) {
+                        addLog("[BT] ACL link dropped — closing socket")
+                        sppBridge.disconnect()   // unblocks readFrame → runLoop exits → reconnect loop fires
+                    }
+                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                registerReceiver(btReceiver, IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED), RECEIVER_NOT_EXPORTED)
+            else
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                registerReceiver(btReceiver, IntentFilter(BluetoothDevice.ACTION_ACL_DISCONNECTED))
+        }
+
         addLog("[BT] Connecting...")
         connectJob = serviceScope.launch {
             try {
@@ -105,10 +135,10 @@ class BtSppService : Service() {
                     // runLoop returned — BT connection dropped; retry until restored
                     var reconnected = false
                     while (isActive && !reconnected) {
-                        addLog("[BT] Reconnecting in 3s...")
+                        addLog("[BT] Reconnecting in 1s...")
                         state.value = BridgeState.CONNECTING
                         updateNotification()
-                        delay(3000)
+                        delay(1000)
                         try {
                             withContext(Dispatchers.IO) {
                                 sppBridge.disconnect()
@@ -144,6 +174,7 @@ class BtSppService : Service() {
         sppBridge.disconnect()
         state.value = BridgeState.IDLE
         addLog("[BT] Disconnected")
+        btReceiver?.let { unregisterReceiver(it) }; btReceiver = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         wakeLock?.release(); wakeLock = null
         wifiLock?.release(); wifiLock = null
@@ -190,6 +221,7 @@ class BtSppService : Service() {
         serviceScope.cancel()
         sppBridge.disconnect()
         localTest.stopRecording()
+        btReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) {} }; btReceiver = null
         wakeLock?.release(); wakeLock = null
         wifiLock?.release(); wifiLock = null
         super.onDestroy()
