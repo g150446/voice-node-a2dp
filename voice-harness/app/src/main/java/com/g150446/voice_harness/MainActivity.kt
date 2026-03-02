@@ -2,10 +2,14 @@ package com.g150446.voice_harness
 
 import android.Manifest
 import android.app.Application
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -37,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -55,109 +60,76 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.g150446.voice_harness.ui.theme.VoiceHarnessTheme
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 enum class BridgeState { IDLE, CONNECTING, CONNECTED, RECORDING, PROCESSING }
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val prefs = app.getSharedPreferences("voice_bridge", Context.MODE_PRIVATE)
-    private val sppBridge = SppBridge()
-    private var connectJob: Job? = null
+    private val _state     = MutableStateFlow(BridgeState.IDLE)
+    private val _logs      = MutableStateFlow<List<String>>(emptyList())
+    private val _testState = MutableStateFlow("IDLE")
 
-    private val _state = MutableStateFlow(BridgeState.IDLE)
-    val state: StateFlow<BridgeState> = _state.asStateFlow()
+    val state:     StateFlow<BridgeState>  = _state.asStateFlow()
+    val logs:      StateFlow<List<String>> = _logs.asStateFlow()
+    val testState: StateFlow<String>       = _testState.asStateFlow()
 
-    private val _logs = MutableStateFlow<List<String>>(emptyList())
-    val logs: StateFlow<List<String>> = _logs.asStateFlow()
+    private var service: BtSppService? = null
+    private var isBound = false
+    private var collectJobs = listOf<Job>()
 
-    // Local test (phone mic → OpenRouter → phone speaker)
-    private val localTest = LocalTest()
-    private var testJob: Job? = null
-    private val _testState = MutableStateFlow("IDLE")  // IDLE | REC | SEND | PLAY
-    val testState: StateFlow<String> = _testState.asStateFlow()
+    private val serviceConn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+            val svc = (binder as BtSppService.LocalBinder).getService()
+            service = svc
+            isBound = true
+            collectJobs = listOf(
+                viewModelScope.launch { svc.state.collect     { _state.value     = it } },
+                viewModelScope.launch { svc.logs.collect      { _logs.value      = it } },
+                viewModelScope.launch { svc.testState.collect { _testState.value = it } }
+            )
+        }
 
-    fun connect() {
-        connectJob?.cancel()
-        _state.value = BridgeState.CONNECTING
-        addLog("[BT] Connecting...")
-        connectJob = viewModelScope.launch {
-            try {
-                withContext(Dispatchers.IO) {
-                    sppBridge.connect(getApplication())
-                }
-                _state.value = BridgeState.CONNECTED
-                addLog("[BT] Connected — PING/PONG verified")
-                sppBridge.runLoop(
-                    apiKey = prefs.getString("openrouter_key", "") ?: "",
-                    model = prefs.getString("openrouter_model", "openai/gpt-audio-mini")
-                        ?: "openai/gpt-audio-mini",
-                    onLog = { addLog(it) },
-                    onStateChange = { stateStr ->
-                        _state.value = when (stateStr) {
-                            "RECORDING"  -> BridgeState.RECORDING
-                            "PROCESSING" -> BridgeState.PROCESSING
-                            "CONNECTED"  -> BridgeState.CONNECTED
-                            "IDLE"       -> BridgeState.IDLE
-                            else         -> _state.value
-                        }
-                    }
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                _state.value = BridgeState.IDLE
-                addLog("[ERR] ${e.message ?: e.javaClass.simpleName}")
-            }
+        override fun onServiceDisconnected(name: ComponentName) {
+            collectJobs.forEach { it.cancel() }
+            collectJobs = emptyList()
+            service = null
+            isBound = false
+            _state.value = BridgeState.IDLE
         }
     }
 
-    fun disconnect() {
-        connectJob?.cancel()
-        connectJob = null
-        sppBridge.disconnect()
-        _state.value = BridgeState.IDLE
-        addLog("[BT] Disconnected")
+    fun bindService(context: Context) {
+        if (!isBound)
+            context.bindService(Intent(context, BtSppService::class.java), serviceConn, 0)
     }
 
-    fun onTestTap() {
-        when (_testState.value) {
-            "IDLE" -> {
-                testJob?.cancel()
-                _testState.value = "REC"
-                addLog("[TEST] Recording — tap again to stop...")
-                testJob = viewModelScope.launch {
-                    val pcm = withContext(Dispatchers.IO) { localTest.record() }
-                    if (pcm.size < 3200) {  // < 0.1s
-                        addLog("[TEST] Too short, discarded")
-                        _testState.value = "IDLE"
-                        return@launch
-                    }
-                    _testState.value = "SEND"
-                    withContext(Dispatchers.IO) {
-                        localTest.sendAndPlay(
-                            pcm = pcm,
-                            apiKey = prefs.getString("openrouter_key", "") ?: "",
-                            model = prefs.getString("openrouter_model", "openai/gpt-audio-mini")
-                                ?: "openai/gpt-audio-mini",
-                            onLog = { addLog(it) },
-                            onState = { s -> _testState.value = s }
-                        )
-                    }
-                    _testState.value = "IDLE"
-                }
-            }
-            "REC" -> localTest.stopRecording()  // coroutine continues after record() returns
-            // SEND / PLAY — ignore taps
+    fun unbindService(context: Context) {
+        if (isBound) {
+            context.unbindService(serviceConn)
+            isBound = false
         }
     }
+
+    fun connect(context: Context) {
+        ContextCompat.startForegroundService(
+            context,
+            Intent(context, BtSppService::class.java).apply { action = BtSppService.ACTION_CONNECT }
+        )
+        if (!isBound)
+            context.bindService(
+                Intent(context, BtSppService::class.java),
+                serviceConn,
+                Context.BIND_AUTO_CREATE
+            )
+    }
+
+    fun disconnect() { service?.disconnect() }
+    fun onTestTap()  { service?.onTestTap() }
 
     fun addLog(msg: String) {
         _logs.value = (_logs.value + msg).takeLast(200)
@@ -165,8 +137,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         super.onCleared()
-        sppBridge.disconnect()
-        localTest.stopRecording()
+        collectJobs.forEach { it.cancel() }
     }
 }
 
@@ -187,10 +158,30 @@ fun AppRoot(vm: MainViewModel = viewModel()) {
     var screen by remember { mutableStateOf("main") }
     val context = LocalContext.current
 
+    // Bind to service when UI is visible; service keeps running in background
+    DisposableEffect(Unit) {
+        vm.bindService(context)
+        onDispose { vm.unbindService(context) }
+    }
+
+    // Request POST_NOTIFICATIONS once on Android 13+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val notifPermLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { /* ignore result — notification is optional */ }
+        LaunchedEffect(Unit) {
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+            ) {
+                notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
+
     val btPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        if (results.values.all { it }) vm.connect()
+        if (results.values.all { it }) vm.connect(context)
         else vm.addLog("[ERR] Bluetooth permissions denied")
     }
 
@@ -214,7 +205,7 @@ fun AppRoot(vm: MainViewModel = viewModel()) {
                 return
             }
         }
-        vm.connect()
+        vm.connect(context)
     }
 
     fun handleTestTap() {
