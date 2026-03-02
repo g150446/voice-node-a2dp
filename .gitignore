@@ -15,3 +15,11 @@ build/
 
 # Claude session data
 .claude/
+
+# Android
+.idea/
+*.iml
+local.properties
+.gradle/
+*.apk
+*.aab

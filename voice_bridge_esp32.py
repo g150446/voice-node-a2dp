@@ -680,7 +680,10 @@ def _text_to_speech_and_send(text: str, ser) -> None:
                 "model": "openai/gpt-audio-mini",
                 "modalities": ["text", "audio"],
                 "audio": {"voice": "alloy", "format": "pcm16"},
-                "messages": [{"role": "user", "content": text}],
+                "messages": [
+                    {"role": "system", "content": "Reply in 1-2 short sentences. Be concise."},
+                    {"role": "user", "content": text},
+                ],
                 "stream": True,
             },
             stream=True,
