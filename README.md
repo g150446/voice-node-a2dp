@@ -1,140 +1,146 @@
-# Voice Node A2DP — M5StickC Plus2 Bluetooth Audio Bridge
+# Voice Bridge ESP32 — WiFi Voice Assistant
 
-Bluetooth audio bridge between **M5StickC Plus2** (+ Hat SPK2) and a Mac.
-Supports bidirectional audio streaming and **real-time speech-to-text** via Whisper.
+WiFi-based voice assistant on **M5StickC Plus2** (+ Hat SPK2) that records speech, sends it to **OpenRouter GPT Audio Mini** via HTTPS, and plays back the AI response through the speaker — all on-device with no companion app needed.
 
 ## Architecture
 
 ```
-┌──────────────────┐       Bluetooth        ┌──────────────┐
-│ M5StickC Plus2   │◄──────────────────────►│  Mac          │
-│ + Hat SPK2       │  A2DP (SINK mode)      │              │
-│                  │  SPP serial (SOURCE)   │  voice_bridge_esp32.py
-│  PDM Mic (16kHz) │────── SPP RFCOMM ─────►│  → Whisper STT│
-└──────────────────┘                        └──────────────┘
+┌──────────────────────┐    HTTPS/SSE     ┌─────────────────────┐
+│  M5StickC Plus2      │◄───── WiFi ─────►│  OpenRouter API     │
+│  + Hat SPK2          │                   │  (gpt-audio-mini)   │
+│                      │                   │                     │
+│  PDM Mic → WAV+b64 ──┼──── Request ────►│  Audio input        │
+│  Hat SPK2 ◄── PCM ───┼──── SSE stream ──│  Audio + text output│
+└──────────────────────┘                   └─────────────────────┘
 ```
 
-### Modes
+### How It Works
 
-| Mode | Direction | Transport | Use Case |
-|------|-----------|-----------|----------|
-| **SINK** | Mac → M5Stick | A2DP | Play Mac audio through Hat SPK2 speaker |
-| **SOURCE** | M5Stick → Mac | BT SPP (serial) | Stream mic audio to Mac for Whisper STT |
+1. **Record**: Press **BtnA** to start recording from the built-in PDM microphone (16 kHz, 16-bit mono). Press **BtnA** again to stop, or recording auto-stops when the buffer is full (~3.3 s on SRAM-only devices).
+2. **Send**: The firmware base64-encodes the WAV data in 3 KB streaming chunks and sends it to OpenRouter's `/api/v1/chat/completions` endpoint with `stream: true`.
+3. **Receive & Play**: The SSE response streams audio chunks (base64 PCM16 at 24 kHz). The firmware decodes, downsamples to 16 kHz, and writes to a **ring buffer**. A dedicated FreeRTOS task drains the ring buffer to the I2S speaker DMA — ensuring smooth playback even during network jitter.
 
-Mode is selected on the device via **BtnA** (SINK) or **BtnB** (SOURCE), stored in NVS, and requires a reboot to switch.
+### Streaming Playback Design
+
+The key design challenge was smooth audio playback while receiving data over WiFi. Three approaches were tested:
+
+| Approach | Problem |
+|----------|---------|
+| M5Unified `playRaw()` | Stores pointer, not copy. Pointer-lifetime and blocking issues cause audio gaps |
+| Direct `i2s_channel_write()` | Single-threaded — network pauses drain the DMA buffer causing silence |
+| **Ring buffer + I2S task** ✅ | Producer-consumer decoupling eliminates gaps |
+
+**Final architecture**:
+- **Producer** (main task, core 1): reads SSE stream → base64 decode → 24→16 kHz downsample → ring buffer write
+- **Consumer** (I2S task, core 0): ring buffer read → `i2s_channel_write()` to DMA
+- **Ring buffer**: ~78 KB heap allocation (~2.4 s of 16 kHz mono audio), providing large jitter tolerance
+- **DMA**: 8 × 256 frames (matches M5Unified defaults), auto-clear enabled
+
+### Memory Budget (M5StickC Plus2, SRAM only)
+
+| Resource | Size | Notes |
+|----------|------|-------|
+| Total SRAM heap | ~272 KB | PSRAM disabled (causes boot loop on this device) |
+| WiFi + SSL overhead | ~42 KB | WiFiClientSecure with mbedTLS |
+| Audio recording buffer | ~105 KB | Dynamically sized = largest free block − 4 KB |
+| Ring buffer (during playback) | ~78 KB | Allocated after freeing recording buffer |
+| I2S DMA | ~8 KB | 8 descriptors × 256 frames × 4 bytes |
+| Free during playback | ~8 KB | For SSL cleanup and small allocations |
+
+**Recording time**: ~3.3 s at 16 kHz (105 KB / 2 bytes per sample / 16000 Hz)
+
+## Extending Recording Time with PSRAM
+
+Devices with PSRAM (e.g., **M5Atom Echo S3R** with 8 MB PSRAM) can dramatically increase recording time:
+
+### What Changes with PSRAM
+
+| Parameter | SRAM only (current) | With 8 MB PSRAM |
+|-----------|---------------------|-------------------|
+| Recording buffer | ~105 KB (~3.3 s) | 1–4 MB (30–120 s) |
+| Ring buffer | ~78 KB (~2.4 s) | 256+ KB (8+ s jitter tolerance) |
+| Max recording time | ~3.3 s | 30+ s (adjustable) |
+| FQBN option | `PSRAM=disabled` | `PSRAM=enabled` (default) |
+
+### How to Adapt the Code
+
+1. **Enable PSRAM**: Change the build FQBN to remove `PSRAM=disabled`:
+   ```bash
+   arduino-cli compile --fqbn m5stack:esp32s3:m5stack_atoms3r voice_bridge_esp32/
+   ```
+
+2. **Use PSRAM for large buffers**: Replace `malloc()` with `ps_malloc()` (or `heap_caps_malloc(size, MALLOC_CAP_SPIRAM)`) for `audioBuf` and `ringBuf` in `setup()` and `callOpenRouter()`.
+
+3. **Increase recording time**: The recording length is determined by `audioBufBytes / sizeof(int16_t) / SAMPLE_RATE`. With PSRAM, allocate a larger buffer:
+   ```cpp
+   audioBufBytes = 960000;  // 960 KB = 30s at 16kHz
+   audioBuf = (int16_t*)ps_malloc(audioBufBytes);
+   ```
+
+4. **Update I2S pin mapping**: The M5Atom Echo S3R has a different speaker (built-in NS4168, no Hat SPK2). Update `SPK_BCLK`, `SPK_LRC`, `SPK_DOUT` to match the new device's GPIO assignments. Also check if the microphone uses I2S instead of the M5StickC's PDM, and update mic configuration accordingly.
+
+5. **ESP32-S3 I2S differences**: The S3 uses `SOC_I2S_HW_VERSION_2`, so the slot config fields differ slightly (uses `left_align`, `big_endian`, `bit_order_lsb` instead of `msb_right`). The `#if SOC_I2S_HW_VERSION_1` preprocessor guard in `i2sSpkBegin()` already handles this.
 
 ## Repository Structure
 
 ```
 ├── voice_bridge_esp32/
-│   └── voice_bridge_esp32.ino      # Arduino firmware for M5StickC Plus2
-├── voice_bridge_esp32.py            # Python companion script (Mac side)
-├── mic_playback_stickc/
-│   └── mic_playback_stickc.ino  # Standalone mic→speaker test sketch
-├── requirements.txt         # Python dependencies
-├── CLAUDE.md                # Build instructions and hardware notes
-└── README.md                # This file
+│   └── voice_bridge_esp32.ino   # Arduino firmware (WiFi voice assistant)
+├── voice_bridge_esp32.py         # Legacy Python companion (Bluetooth mode)
+├── hfp_headset/                  # HFP headset experiment
+├── requirements.txt              # Python dependencies (legacy)
+├── CLAUDE.md                     # Build instructions and hardware notes
+└── README.md                     # This file
 ```
 
-### Firmware (`voice_bridge_esp32/voice_bridge_esp32.ino`)
-
-Single Arduino sketch with two runtime modes:
-
-- **SINK mode**: Uses `BluetoothA2DPSink` to receive A2DP audio from Mac and play through Hat SPK2 via I2S.
-- **SOURCE mode**: Uses `BluetoothSerial` (SPP) to stream 16kHz mono PCM from the built-in PDM microphone over Bluetooth serial to the Mac.
-
-The SPP audio frame protocol:
-```
-[0x55][0xAA][len_hi][len_lo][pcm_data...]
-```
-- Magic: `0x55AA` (2 bytes)
-- Length: uint16 big-endian (PCM bytes following)
-- PCM: int16_t little-endian, 16kHz mono, 512 samples per frame (~32ms)
-
-### Python Companion (`voice_bridge_esp32.py`)
-
-Mac-side CLI tool with these subcommands:
-
-| Command | Description |
-|---------|-------------|
-| `list` | Print all audio devices |
-| `pair` | Scan, pair, and connect M5Stick via Bluetooth |
-| `configure` | Write Mac's BT name to M5Stick NVS via USB serial |
-| `sink` | Mac mic → M5Stick speaker (A2DP) |
-| `source` | M5Stick mic → Mac speakers |
-| `transcribe` | **M5Stick mic → Whisper STT via BT serial** |
-
-## Quick Start
+## Build & Upload
 
 ### Prerequisites
 
 - **Hardware**: M5StickC Plus2 with Hat SPK2
-- **Arduino**: `arduino-cli` with `m5stack:esp32` board package and `M5StickCPlus2` library
-- **Mac**: Python 3.10+, `blueutil` (`brew install blueutil`)
-- **Whisper**: A Whisper STT server (e.g. [faster-whisper-server](https://github.com/fedirz/faster-whisper-server)) running on `http://localhost:9000`
+- **Arduino CLI**: with `m5stack:esp32` board package and `M5StickCPlus2` library
+- **WiFi**: 2.4 GHz network (hotspot or router)
+- **API Key**: OpenRouter API key with access to `openai/gpt-audio-mini`
 
-### 1. Flash Firmware
+### 1. Set WiFi Credentials
 
-```bash
-arduino-cli compile --fqbn m5stack:esp32:m5stack_stickc_plus2 voice_bridge_esp32/
-arduino-cli upload -p /dev/tty.usbserial-* --fqbn m5stack:esp32:m5stack_stickc_plus2 voice_bridge_esp32/
-```
+Edit the `WIFI_SSID` and `WIFI_PASS` constants near the top of `voice_bridge_esp32.ino`.
 
-### 2. Install Python Dependencies
+### 2. Flash Firmware
 
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+arduino-cli compile --fqbn "m5stack:esp32:m5stack_stickc_plus2:PSRAM=disabled" voice_bridge_esp32/
+arduino-cli upload -p /dev/tty.usbserial-* --fqbn "m5stack:esp32:m5stack_stickc_plus2:PSRAM=disabled" voice_bridge_esp32/
 ```
 
-### 3. Pair the Device
+> **Important**: PSRAM must be disabled for M5StickC Plus2 — enabling it causes an infinite boot loop (`RTCWDT_RTC_RESET`).
 
-Press **BtnB** on M5StickC to enter SOURCE mode (requires reboot). Then:
+### 3. Set API Key
 
-```bash
-python voice_bridge_esp32.py pair --device M5StickC
+Via USB serial at 115200 baud:
+```
+SET_KEY:sk-or-v1-your-key-here
 ```
 
-> **Note**: macOS Bluetooth Settings may show the device as "Not Connected" after pairing. This is normal — the `transcribe` command establishes its own SPP connection via IOBluetooth SDP discovery. You don't need the device to show "Connected" in System Settings.
+The key is stored in NVS (non-volatile storage) and persists across reboots.
 
-### 4. Run Speech-to-Text
+### 4. Use
 
-```bash
-# Start your Whisper server first, then:
-python voice_bridge_esp32.py transcribe --whisper-url http://localhost:9000
-```
-
-The script will:
-1. Auto-discover the BT serial port (triggers macOS SDP discovery if needed)
-2. Connect to M5StickC via SPP
-3. Stream mic audio and detect voice activity
-4. Send speech segments to the Whisper server
-5. Print transcriptions in real-time as `>>> transcribed text`
-
-### Options
-
-```
---whisper-url URL    Whisper server URL (default: http://localhost:9000)
---bt-port PORT       BT serial port (auto-detected if omitted)
---chunk-sec SEC      Max audio chunk duration (default: 3.0s)
---silence-thresh N   RMS silence threshold for VAD (default: 0.02)
-```
+- **BtnA**: Start/stop recording. After recording stops, the audio is sent to the API and the response plays automatically.
+- The display shows recording progress, status messages, and WiFi state.
 
 ## Serial Commands
 
-Connect to the USB serial port at 115200 baud to control the device:
-
 | Command | Description |
 |---------|-------------|
-| `status` | Print current mode, BT state, remote name |
-| `sink` | Switch to SINK mode (restarts) |
-| `source` | Switch to SOURCE mode (restarts) |
-| `SET_REMOTE:<name>` | Store Mac BT name in NVS (for SINK mode) |
+| `status` | Print state, WiFi IP, API key status, free heap |
+| `SET_KEY:<key>` | Store OpenRouter API key in NVS |
 | `help` | Print command list |
 
 ## Hardware Notes
 
-- **GPIO0** is shared between the PDM microphone (WS/clock) and Hat SPK2 (LRC). They cannot run simultaneously.
-- The speaker must be stopped (`Speaker.end()`) before starting the mic (`Mic.begin()`), and vice versa.
+- **GPIO0** is shared between the PDM microphone (WS/clock) and Hat SPK2 (LRC). They cannot run simultaneously — `Mic.end()` must be called before starting the speaker, and vice versa.
 - Hat SPK2 I2S pins: DOUT=25, BCLK=26, LRC=0
-- M5StickC Plus2 BT address: base MAC + 2
+- Hat SPK2 uses NS4168 amplifier with L/R pin grounded
+- The I2S driver uses ESP-IDF v5's new API (`driver/i2s_std.h`). The legacy `driver/i2s.h` cannot coexist with M5Unified.
+- M5Unified's Speaker is intentionally bypassed during TTS playback. Direct I2S via `i2s_new_channel()` / `i2s_channel_write()` avoids pointer-stability and blocking issues in `playRaw()`.
