@@ -117,12 +117,18 @@ arduino-cli upload -p /dev/tty.usbserial-* --fqbn "m5stack:esp32:m5stack_stickc_
 
 ### 3. Set API Key
 
-Via USB serial at 115200 baud:
+Store your OpenRouter API key in an environment variable (`OPENROUTER_API_KEY`), then use the included script:
+
+```bash
+./set_api_key.sh
+```
+
+Or manually via USB serial at 115200 baud:
 ```
 SET_KEY:sk-or-v1-your-key-here
 ```
 
-The key is stored in NVS (non-volatile storage) and persists across reboots.
+The key is stored in NVS (non-volatile storage) and persists across reboots. No API key is hardcoded in the firmware.
 
 ### 4. Use
 
@@ -141,7 +147,7 @@ The key is stored in NVS (non-volatile storage) and persists across reboots.
 
 The firmware enters **ESP32 light sleep** after 10 seconds of inactivity in the idle state. This reduces power consumption while allowing instant wake-up:
 
-- **Sleep trigger**: No BtnA press for 10 seconds while idle
+- **Sleep trigger**: No button press or serial input for 10 seconds while idle
 - **Wake source**: BtnA press (EXT0 wakeup on GPIO37, active LOW)
 - **On sleep**: Mic, display, and WiFi are shut down
 - **On wake**: Display, WiFi, and mic are restored automatically; the wake button press is consumed so it doesn't trigger recording

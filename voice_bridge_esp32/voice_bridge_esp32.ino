@@ -32,8 +32,7 @@ static const char* WIFI_PASS = "88888888";
 
 static const char* API_HOST = "openrouter.ai";
 static const char* API_PATH = "/api/v1/chat/completions";
-static const char* DEFAULT_API_KEY =
-    "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";
+static const char* DEFAULT_API_KEY = "";  // Set via serial: SET_KEY:<key>
 
 // ---------------------------------------------------------------------------
 // NVS
@@ -804,6 +803,7 @@ static bool callOpenRouter() {
 // ---------------------------------------------------------------------------
 static void handleSerial() {
     if (!Serial.available()) return;
+    lastActivityMs = millis();
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) return;
